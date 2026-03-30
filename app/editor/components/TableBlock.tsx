@@ -1,225 +1,112 @@
 'use client';
 
-import React, { useRef, useState, useCallback, useEffect } from 'react';
-import { Plus, Trash2 } from 'lucide-react';
-import { BlockData, TableData } from '../types';
+import React, { useRef, useLayoutEffect, useState } from 'react';
+import {
+  Plus, Trash2, Palette, ChevronRight, ArrowUp, ArrowDown,
+  Copy, XCircle, TableProperties
+} from 'lucide-react';
+import { BlockData } from '../types';
+import { useTableBlock } from '../hooks/useTableBlock';
+import { TABLE_TEXT_COLORS as TEXT_COLORS, TABLE_BG_COLORS as BG_COLORS } from '../constants';
+
+// --- Helpers ---
+
+function getSelectionBounds(cells: Set<string>) {
+  let minR = Infinity, maxR = -1, minC = Infinity, maxC = -1;
+  cells.forEach(k => {
+    const [r, c] = k.split('-').map(Number);
+    if (r < minR) minR = r; if (r > maxR) maxR = r;
+    if (c < minC) minC = c; if (c > maxC) maxC = c;
+  });
+  return { minR, maxR, minC, maxC };
+}
+
+// --- Component ---
 
 interface TableBlockProps {
   block: BlockData;
   updateBlock: (id: string, updates: Partial<BlockData>) => void;
+  onNavigateOut?: (direction: 'up' | 'down') => void;
 }
 
-interface ContextMenu {
-  x: number;
-  y: number;
-  rowIdx: number;
-  colIdx: number;
-}
+export const TableBlock: React.FC<TableBlockProps> = (props) => {
+  if (!props.block.tableData) return null;
+  return <TableBlockInner {...props} />;
+};
 
-export const TableBlock: React.FC<TableBlockProps> = ({ block, updateBlock }) => {
-  const tableData = block.tableData;
-  const tableRef = useRef<HTMLTableElement>(null);
-  const [isHovered, setIsHovered] = useState(false);
-  const [resizingCol, setResizingCol] = useState<number | null>(null);
-  const [contextMenu, setContextMenu] = useState<ContextMenu | null>(null);
-  const resizeStartX = useRef(0);
-  const resizeStartWidths = useRef<number[]>([]);
-  const lastSyncedData = useRef<string>('');
-  const hideTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
+const TableBlockInner: React.FC<TableBlockProps> = (props) => {
+  const {
+    rows, columnWidths, hasHeaderRow,
+    addRow, addColumn, insertRowBefore, insertRowAfter,
+    deleteRow, deleteColumn, duplicateRow, toggleHeaderRow,
+    clearCellContents, updateCellColors,
+    selectedCells,
+    handleCellMouseDown, handleCellMouseEnter,
+    handleCellKeyDown, handleCellInput, handleCellBlur,
+    contextMenu, setContextMenu, colorSubmenu, setColorSubmenu, handleContextMenu,
+    handleResizeStart,
+    isHovered, handleMouseEnter, handleMouseLeave,
+    tableRef,
+  } = useTableBlock(props);
 
-  const handleMouseEnter = useCallback(() => {
-    if (hideTimeout.current) { clearTimeout(hideTimeout.current); hideTimeout.current = null; }
-    setIsHovered(true);
-  }, []);
+  const { block } = props;
+  const hasMultiSelection = selectedCells.size > 1;
+  const selBounds = hasMultiSelection ? getSelectionBounds(selectedCells) : null;
 
-  const handleMouseLeave = useCallback(() => {
-    hideTimeout.current = setTimeout(() => setIsHovered(false), 250);
-  }, []);
+  // Dynamic context menu positioning
+  const contextMenuRef = useRef<HTMLDivElement>(null);
+  const [menuPos, setMenuPos] = useState<{ left: number; top: number } | null>(null);
 
-  if (!tableData) return null;
+  useLayoutEffect(() => {
+    if (!contextMenu || !contextMenuRef.current) {
+      setMenuPos(null);
+      return;
+    }
+    const rect = contextMenuRef.current.getBoundingClientRect();
+    const vh = window.innerHeight;
+    const vw = window.innerWidth;
+    let top = contextMenu.y;
+    let left = contextMenu.x;
 
-  const { rows, columnWidths, hasHeaderRow } = tableData;
-
-  const updateTableData = useCallback((newData: Partial<TableData>) => {
-    updateBlock(block.id, {
-      tableData: { ...tableData, ...newData },
-    });
-  }, [block.id, tableData, updateBlock]);
-
-  // Sync cell DOM content from tableData (for undo/redo/external changes)
-  // eslint-disable-next-line react-hooks/rules-of-hooks
-  useEffect(() => {
-    const dataKey = JSON.stringify(rows);
-    if (lastSyncedData.current === dataKey) return;
-    lastSyncedData.current = dataKey;
-
-    rows.forEach((row, ri) => {
-      row.forEach((cell, ci) => {
-        const el = document.querySelector(
-          `[data-table-cell="${block.id}-${ri}-${ci}"]`
-        ) as HTMLElement;
-        if (el) {
-          const currentHtml = el.innerHTML;
-          const targetHtml = cell.content.replace(/\n/g, '<br>');
-          if (currentHtml !== targetHtml) {
-            el.innerHTML = targetHtml;
-          }
-        }
-      });
-    });
-  }, [rows, block.id]);
-
-  // Close context menu on outside click
-  // eslint-disable-next-line react-hooks/rules-of-hooks
-  useEffect(() => {
-    if (!contextMenu) return;
-    const close = () => setContextMenu(null);
-    window.addEventListener('click', close);
-    return () => window.removeEventListener('click', close);
+    if (top + rect.height > vh) {
+      top = Math.max(4, contextMenu.y - rect.height);
+    }
+    if (left + rect.width > vw) {
+      left = Math.max(4, vw - rect.width - 4);
+    }
+    setMenuPos({ left, top });
   }, [contextMenu]);
 
-  const handleCellBlur = useCallback((rowIdx: number, colIdx: number, el: HTMLDivElement) => {
-    const content = el.innerHTML;
-    const newRows = rows.map((row, ri) =>
-      row.map((cell, ci) =>
-        ri === rowIdx && ci === colIdx ? { content } : cell
-      )
-    );
-    lastSyncedData.current = JSON.stringify(newRows);
-    updateTableData({ rows: newRows });
-  }, [rows, updateTableData]);
+  // Dynamic color submenu positioning
+  const colorMenuRef = useRef<HTMLDivElement>(null);
+  const colorTriggerRef = useRef<HTMLDivElement>(null);
+  const [colorMenuPos, setColorMenuPos] = useState<{ left: number; top: number } | null>(null);
 
-  const handleCellKeyDown = useCallback((
-    e: React.KeyboardEvent<HTMLDivElement>,
-    rowIdx: number,
-    colIdx: number
-  ) => {
-    if (e.key === '/') {
-      e.stopPropagation();
+  useLayoutEffect(() => {
+    if (!colorSubmenu || !colorMenuRef.current || !contextMenuRef.current) {
+      setColorMenuPos(null);
+      return;
+    }
+    const mainRect = contextMenuRef.current.getBoundingClientRect();
+    const colorRect = colorMenuRef.current.getBoundingClientRect();
+    const vh = window.innerHeight;
+    const vw = window.innerWidth;
+
+    // Position to the right of the main menu
+    let left = mainRect.right + 2;
+    if (left + colorRect.width > vw) {
+      left = Math.max(4, mainRect.left - colorRect.width - 2);
     }
 
-    if (e.key === 'Enter') {
-      e.stopPropagation();
-      if (!e.shiftKey) {
-        e.preventDefault();
-        const nextRow = rowIdx + 1;
-        if (nextRow < rows.length) {
-          const nextCell = document.querySelector(
-            `[data-table-cell="${block.id}-${nextRow}-${colIdx}"]`
-          ) as HTMLElement;
-          nextCell?.focus();
-        }
-      }
+    // Align top with the "Cor" trigger, but clamp to viewport
+    const triggerRect = colorTriggerRef.current?.getBoundingClientRect();
+    let top = triggerRect ? triggerRect.top : mainRect.top;
+    if (top + colorRect.height > vh) {
+      top = Math.max(4, vh - colorRect.height - 4);
     }
 
-    if (e.key === 'Tab') {
-      e.preventDefault();
-      e.stopPropagation();
-
-      let nextRow = rowIdx;
-      let nextCol = colIdx;
-
-      if (e.shiftKey) {
-        nextCol--;
-        if (nextCol < 0) {
-          nextRow--;
-          nextCol = columnWidths.length - 1;
-        }
-      } else {
-        nextCol++;
-        if (nextCol >= columnWidths.length) {
-          nextRow++;
-          nextCol = 0;
-        }
-      }
-
-      if (nextRow >= 0 && nextRow < rows.length) {
-        const nextCell = document.querySelector(
-          `[data-table-cell="${block.id}-${nextRow}-${nextCol}"]`
-        ) as HTMLElement;
-        nextCell?.focus();
-      }
-    }
-  }, [block.id, rows, columnWidths.length]);
-
-  const handleContextMenu = useCallback((
-    e: React.MouseEvent,
-    rowIdx: number,
-    colIdx: number
-  ) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setContextMenu({ x: e.clientX, y: e.clientY, rowIdx, colIdx });
-  }, []);
-
-  const addColumn = useCallback(() => {
-    const newColCount = columnWidths.length + 1;
-    const newWidths = Array(newColCount).fill(100 / newColCount);
-    const newRows = rows.map(row => [...row, { content: '' }]);
-    updateTableData({ rows: newRows, columnWidths: newWidths });
-  }, [rows, columnWidths, updateTableData]);
-
-  const addRow = useCallback(() => {
-    const newRow = Array.from({ length: columnWidths.length }, () => ({ content: '' }));
-    updateTableData({ rows: [...rows, newRow] });
-  }, [rows, columnWidths.length, updateTableData]);
-
-  const deleteRow = useCallback((rowIdx: number) => {
-    if (rows.length <= 1) return; // keep at least 1 row
-    const newRows = rows.filter((_, i) => i !== rowIdx);
-    updateTableData({ rows: newRows });
-    setContextMenu(null);
-  }, [rows, updateTableData]);
-
-  const deleteColumn = useCallback((colIdx: number) => {
-    if (columnWidths.length <= 1) return; // keep at least 1 column
-    const newRows = rows.map(row => row.filter((_, i) => i !== colIdx));
-    const newColCount = columnWidths.length - 1;
-    const newWidths = Array(newColCount).fill(100 / newColCount);
-    updateTableData({ rows: newRows, columnWidths: newWidths });
-    setContextMenu(null);
-  }, [rows, columnWidths, updateTableData]);
-
-  // Column resize handlers
-  const handleResizeStart = useCallback((e: React.MouseEvent, colIdx: number) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setResizingCol(colIdx);
-    resizeStartX.current = e.clientX;
-    resizeStartWidths.current = [...columnWidths];
-  }, [columnWidths]);
-
-  useEffect(() => {
-    if (resizingCol === null) return;
-
-    const handleMouseMove = (e: MouseEvent) => {
-      if (!tableRef.current) return;
-      const tableWidth = tableRef.current.offsetWidth;
-      const deltaPercent = ((e.clientX - resizeStartX.current) / tableWidth) * 100;
-      const newWidths = [...resizeStartWidths.current];
-      const minWidth = 5;
-
-      const newLeft = newWidths[resizingCol] + deltaPercent;
-      const newRight = newWidths[resizingCol + 1] - deltaPercent;
-
-      if (newLeft >= minWidth && newRight >= minWidth) {
-        newWidths[resizingCol] = newLeft;
-        newWidths[resizingCol + 1] = newRight;
-        updateTableData({ columnWidths: newWidths });
-      }
-    };
-
-    const handleMouseUp = () => {
-      setResizingCol(null);
-    };
-
-    document.addEventListener('mousemove', handleMouseMove);
-    document.addEventListener('mouseup', handleMouseUp);
-    return () => {
-      document.removeEventListener('mousemove', handleMouseMove);
-      document.removeEventListener('mouseup', handleMouseUp);
-    };
-  }, [resizingCol, updateTableData]);
+    setColorMenuPos({ left, top });
+  }, [colorSubmenu]);
 
   return (
     <div
@@ -227,10 +114,9 @@ export const TableBlock: React.FC<TableBlockProps> = ({ block, updateBlock }) =>
       onMouseEnter={handleMouseEnter}
       onMouseLeave={handleMouseLeave}
     >
-
       <table
         ref={tableRef}
-        className="w-full border-collapse border border-gray-200"
+        className={`w-full border-collapse border border-gray-200 ${hasMultiSelection ? 'select-none' : ''}`}
         style={{ tableLayout: 'fixed' }}
       >
         <colgroup>
@@ -241,33 +127,56 @@ export const TableBlock: React.FC<TableBlockProps> = ({ block, updateBlock }) =>
         <tbody>
           {rows.map((row, rowIdx) => (
             <tr key={rowIdx}>
-              {row.map((cell, colIdx) => (
-                <td
-                  key={colIdx}
-                  className={`border border-gray-200 relative ${
-                    hasHeaderRow && rowIdx === 0
-                      ? 'bg-gray-50 font-medium'
-                      : 'bg-white'
-                  }`}
-                  onContextMenu={e => handleContextMenu(e, rowIdx, colIdx)}
-                >
-                  <div
-                    data-table-cell={`${block.id}-${rowIdx}-${colIdx}`}
-                    contentEditable
-                    suppressContentEditableWarning
-                    className="outline-none px-2 py-1.5 text-sm text-gray-700 min-h-[28px] break-words"
-                    onBlur={e => handleCellBlur(rowIdx, colIdx, e.currentTarget)}
-                    onKeyDown={e => handleCellKeyDown(e, rowIdx, colIdx)}
-                  />
-                  {colIdx < columnWidths.length - 1 && (
+              {row.map((cell, colIdx) => {
+                const cellKey = `${rowIdx}-${colIdx}`;
+                const isSelected = selectedCells.has(cellKey);
+                const isHeader = hasHeaderRow && rowIdx === 0;
+
+                // Selection outline: only draw borders on the edges of the rectangle
+                let selShadow: string | undefined;
+                if (isSelected && selBounds) {
+                  const parts: string[] = [];
+                  if (rowIdx === selBounds.minR) parts.push('inset 0 2px 0 0 #3b82f6');
+                  if (rowIdx === selBounds.maxR) parts.push('inset 0 -2px 0 0 #3b82f6');
+                  if (colIdx === selBounds.minC) parts.push('inset 2px 0 0 0 #3b82f6');
+                  if (colIdx === selBounds.maxC) parts.push('inset -2px 0 0 0 #3b82f6');
+                  if (parts.length > 0) selShadow = parts.join(', ');
+                }
+
+                return (
+                  <td
+                    key={colIdx}
+                    className={`border border-gray-200 relative ${
+                      !selShadow ? 'has-focus:shadow-[inset_0_0_0_2px_#3b82f6]' : ''
+                    } ${isHeader ? 'font-medium' : ''}`}
+                    style={{
+                      backgroundColor: cell.bgColor || (isHeader ? '#F9FAFB' : 'white'),
+                      boxShadow: selShadow,
+                    }}
+                    onContextMenu={e => handleContextMenu(e, rowIdx, colIdx)}
+                    onMouseDown={e => handleCellMouseDown(e, rowIdx, colIdx)}
+                    onMouseEnter={() => handleCellMouseEnter(rowIdx, colIdx)}
+                  >
                     <div
-                      className="absolute top-0 right-0 w-1 h-full cursor-col-resize hover:bg-blue-400 z-10"
-                      style={{ transform: 'translateX(50%)' }}
-                      onMouseDown={e => handleResizeStart(e, colIdx)}
+                      data-table-cell={`${block.id}-${rowIdx}-${colIdx}`}
+                      contentEditable
+                      suppressContentEditableWarning
+                      className="outline-none px-2 py-1.5 text-sm min-h-7 wrap-break-word"
+                      style={{ color: cell.textColor || '#374151' }}
+                      onInput={e => handleCellInput(rowIdx, colIdx, e.currentTarget as HTMLDivElement)}
+                      onBlur={e => handleCellBlur(rowIdx, colIdx, e.currentTarget)}
+                      onKeyDown={e => handleCellKeyDown(e, rowIdx, colIdx)}
                     />
-                  )}
-                </td>
-              ))}
+                    {colIdx < columnWidths.length - 1 && (
+                      <div
+                        className="absolute top-0 right-0 w-1 h-full cursor-col-resize hover:bg-blue-400 z-10"
+                        style={{ transform: 'translateX(50%)' }}
+                        onMouseDown={e => handleResizeStart(e, colIdx)}
+                      />
+                    )}
+                  </td>
+                );
+              })}
             </tr>
           ))}
         </tbody>
@@ -297,25 +206,164 @@ export const TableBlock: React.FC<TableBlockProps> = ({ block, updateBlock }) =>
         </button>
       )}
 
-      {/* Context menu for delete row/column */}
+      {/* Context menu */}
       {contextMenu && (
         <div
-          className="fixed bg-white shadow-xl border border-gray-200 rounded-lg p-1 w-48 z-50"
-          style={{ left: contextMenu.x, top: contextMenu.y }}
+          ref={contextMenuRef}
+          data-table-context-menu
+          className="fixed bg-white shadow-xl border border-gray-200 rounded-lg py-1 w-52 z-50"
+          style={{
+            left: menuPos ? menuPos.left : contextMenu.x,
+            top: menuPos ? menuPos.top : contextMenu.y,
+            visibility: menuPos ? 'visible' : 'hidden',
+          }}
           onMouseDown={e => { e.preventDefault(); e.stopPropagation(); }}
           onClick={e => e.stopPropagation()}
         >
+          {/* Header row toggle */}
           <button
-            className="flex items-center gap-2 w-full px-2 py-1.5 text-sm text-left rounded text-red-600 hover:bg-red-50 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-            onClick={() => deleteRow(contextMenu.rowIdx)}
+            className="flex items-center justify-between w-full px-3 py-1.5 text-sm text-left hover:bg-gray-100 transition-colors"
+            onClick={() => { toggleHeaderRow(); setContextMenu(null); }}
+          >
+            <span className="flex items-center gap-2">
+              <TableProperties size={14} className="text-gray-500" />
+              Linha do cabeçalho
+            </span>
+            <div className={`w-8 h-4.5 rounded-full transition-colors flex items-center ${
+              hasHeaderRow ? 'bg-blue-500 justify-end' : 'bg-gray-300 justify-start'
+            }`}>
+              <div className="w-3.5 h-3.5 rounded-full bg-white mx-0.5 shadow-sm" />
+            </div>
+          </button>
+
+          {/* Color submenu trigger */}
+          <div
+            ref={colorTriggerRef}
+            className="relative"
+            onMouseEnter={() => setColorSubmenu(true)}
+            onMouseLeave={(e) => {
+              const related = e.relatedTarget as Node | null;
+              if (colorMenuRef.current && related && colorMenuRef.current.contains(related)) return;
+              setColorSubmenu(false);
+            }}
+          >
+            <button className="flex items-center justify-between w-full px-3 py-1.5 text-sm text-left hover:bg-gray-100 transition-colors">
+              <span className="flex items-center gap-2">
+                <Palette size={14} className="text-gray-500" />
+                Cor
+              </span>
+              <ChevronRight size={14} className="text-gray-400" />
+            </button>
+
+            {colorSubmenu && (
+              <div
+                ref={colorMenuRef}
+                data-table-context-menu
+                className="fixed bg-white shadow-xl border border-gray-200 rounded-lg py-2 w-52 z-50 max-h-[70vh] overflow-y-auto"
+                style={{
+                  left: colorMenuPos ? colorMenuPos.left : undefined,
+                  top: colorMenuPos ? colorMenuPos.top : undefined,
+                  visibility: colorMenuPos ? 'visible' : 'hidden',
+                }}
+                onMouseDown={e => { e.preventDefault(); e.stopPropagation(); }}
+                onClick={e => e.stopPropagation()}
+                onMouseLeave={(e) => {
+                  const related = e.relatedTarget as Node | null;
+                  if (colorTriggerRef.current && related && colorTriggerRef.current.contains(related)) return;
+                  setColorSubmenu(false);
+                }}
+              >
+                <div className="px-3 pb-1 text-xs font-medium text-gray-500">Cor do texto</div>
+                {TEXT_COLORS.map(c => (
+                  <button
+                    key={c.name}
+                    className="flex items-center gap-2.5 w-full px-3 py-1 text-sm text-left hover:bg-gray-100 transition-colors"
+                    onClick={() => {
+                      updateCellColors(contextMenu.targetCells, { textColor: c.value });
+                      setContextMenu(null);
+                    }}
+                  >
+                    <span
+                      className="w-5 h-5 flex items-center justify-center rounded font-bold text-sm border border-gray-200"
+                      style={{ color: c.preview }}
+                    >A</span>
+                    {c.name}
+                  </button>
+                ))}
+
+                <div className="border-t border-gray-200 my-1.5" />
+
+                <div className="px-3 pb-1 text-xs font-medium text-gray-500">Cor de fundo</div>
+                {BG_COLORS.map(c => (
+                  <button
+                    key={c.name}
+                    className="flex items-center gap-2.5 w-full px-3 py-1 text-sm text-left hover:bg-gray-100 transition-colors"
+                    onClick={() => {
+                      updateCellColors(contextMenu.targetCells, { bgColor: c.value });
+                      setContextMenu(null);
+                    }}
+                  >
+                    <span
+                      className="w-5 h-5 rounded border border-gray-200"
+                      style={{ backgroundColor: c.preview }}
+                    />
+                    {c.name}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div className="border-t border-gray-200 my-1" />
+
+          <button
+            className="flex items-center gap-2 w-full px-3 py-1.5 text-sm text-left hover:bg-gray-100 transition-colors"
+            onClick={() => { insertRowBefore(contextMenu.rowIdx); setContextMenu(null); }}
+          >
+            <ArrowUp size={14} className="text-gray-500" />
+            Inserir acima
+          </button>
+
+          <button
+            className="flex items-center gap-2 w-full px-3 py-1.5 text-sm text-left hover:bg-gray-100 transition-colors"
+            onClick={() => { insertRowAfter(contextMenu.rowIdx); setContextMenu(null); }}
+          >
+            <ArrowDown size={14} className="text-gray-500" />
+            Inserir abaixo
+          </button>
+
+          <button
+            className="flex items-center gap-2 w-full px-3 py-1.5 text-sm text-left hover:bg-gray-100 transition-colors"
+            onClick={() => { duplicateRow(contextMenu.rowIdx); setContextMenu(null); }}
+          >
+            <Copy size={14} className="text-gray-500" />
+            Duplicar
+          </button>
+
+          <div className="border-t border-gray-200 my-1" />
+
+          <button
+            className="flex items-center gap-2 w-full px-3 py-1.5 text-sm text-left hover:bg-gray-100 transition-colors"
+            onClick={() => { clearCellContents(contextMenu.targetCells); setContextMenu(null); }}
+          >
+            <XCircle size={14} className="text-gray-500" />
+            Apagar conteúdo
+          </button>
+
+          <div className="border-t border-gray-200 my-1" />
+
+          <button
+            className="flex items-center gap-2 w-full px-3 py-1.5 text-sm text-left rounded text-red-600 hover:bg-red-50 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+            onClick={() => { deleteRow(contextMenu.rowIdx); setContextMenu(null); }}
             disabled={rows.length <= 1}
           >
             <Trash2 size={14} />
             Deletar linha
           </button>
+
           <button
-            className="flex items-center gap-2 w-full px-2 py-1.5 text-sm text-left rounded text-red-600 hover:bg-red-50 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-            onClick={() => deleteColumn(contextMenu.colIdx)}
+            className="flex items-center gap-2 w-full px-3 py-1.5 text-sm text-left rounded text-red-600 hover:bg-red-50 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+            onClick={() => { deleteColumn(contextMenu.colIdx); setContextMenu(null); }}
             disabled={columnWidths.length <= 1}
           >
             <Trash2 size={14} />

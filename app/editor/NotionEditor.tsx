@@ -1,10 +1,9 @@
 'use client';
 
-import React, { useState, useRef, useCallback } from 'react';
-import { BlockData, SlashMenuState, ViewMode, NotionEditorProps } from './types';
-import { getPaginatedBlocks, focusBlock, createDefaultTableData } from './utils';
+import React, { useState, useRef, useCallback, useMemo } from 'react';
+import { BlockData, SlashMenuState, ViewMode, NotionEditorProps, EditorConfig } from './types';
+import { getPaginatedBlocks, focusBlock, createDefaultTableData, generateId, isContentEmpty, getListNumber } from './utils';
 import {
-  useHistory,
   useBlockManager,
   useSelection,
   useDragAndDrop,
@@ -12,18 +11,24 @@ import {
   useKeyboardShortcuts,
   usePagination
 } from './hooks';
-import { Block, SlashMenu, Toolbar, SelectionOverlay } from './components';
+import { Block, SlashMenu, Toolbar, SelectionOverlay, FloatingToolbar } from './components';
+import { FontLoader } from './components/FontLoader';
+import { SYSTEM_FONTS } from './fonts';
+import { EditorProvider, EditorDataSource, useLocalDataSource } from './EditorProvider';
 
 const DEFAULT_BLOCK: BlockData = { id: 'initial-block', type: 'text', content: '' };
 
-export const NotionEditor: React.FC<NotionEditorProps> = ({
-  initialBlocks = [DEFAULT_BLOCK],
-  onChange,
-  defaultViewMode = 'paginated',
-  title = 'MiniNotion'
-}) => {
-  const [blocks, setBlocksRaw, undoRaw, redoRaw, canUndo, canRedo] = useHistory<BlockData[]>(initialBlocks);
+const NotionEditorInner: React.FC<{
+  dataSource: EditorDataSource;
+  onChange?: (blocks: BlockData[]) => void;
+  defaultViewMode: ViewMode;
+  title: string;
+  config: EditorConfig;
+}> = ({ dataSource, onChange, defaultViewMode, title, config }) => {
+  const { blocks, setBlocks: setBlocksRaw, undo: undoRaw, redo: redoRaw, canUndo, canRedo } = dataSource;
+
   const [viewMode, setViewMode] = useState<ViewMode>(defaultViewMode);
+  const [documentFont, setDocumentFont] = useState<string>(SYSTEM_FONTS[0].family);
   const [slashMenu, setSlashMenu] = useState<SlashMenuState>({
     isOpen: false, x: 0, y: 0, blockId: null
   });
@@ -36,17 +41,16 @@ export const NotionEditor: React.FC<NotionEditorProps> = ({
     startSelection, clearSelection, didDragSelect
   } = useSelection({ blocks, containerRef, blockRefs });
 
-  // Ref to capture current selectedIds without stale closures
+  // Track selected IDs for history through the proper interface
   const selectedIdsRef = useRef(selectedIds);
   selectedIdsRef.current = selectedIds;
 
-  // Wrap setBlocks to save current selection in history before advancing
   const setBlocks = useCallback((newBlocks: BlockData[]) => {
-    setBlocksRaw(newBlocks, Array.from(selectedIdsRef.current));
+    dataSource.trackSelectedIds?.(Array.from(selectedIdsRef.current));
+    setBlocksRaw(newBlocks);
     onChange?.(newBlocks);
-  }, [setBlocksRaw, onChange]);
+  }, [setBlocksRaw, onChange, dataSource]);
 
-  // Wrap undo/redo to also restore selection state
   const undo = useCallback(() => {
     const restoredIds = undoRaw();
     setSelectedIds(new Set(restoredIds));
@@ -57,9 +61,9 @@ export const NotionEditor: React.FC<NotionEditorProps> = ({
     setSelectedIds(new Set(restoredIds));
   }, [redoRaw, setSelectedIds]);
 
-  const { blockHeights, handleHeightChange } = usePagination({ blocks, setBlocks, viewMode });
+  const { blockHeights, handleHeightChange } = usePagination({ blocks, setBlocks, viewMode, pageContentHeight: config.pageContentHeight });
 
-  const { updateBlock, addBlock, addListBlock, removeBlock, deleteSelectedBlocks, moveBlocks } = useBlockManager({
+  const { updateBlock, addBlock, addBlockBefore, addBlockWithContent, addListBlock, removeBlock, mergeWithPrevious, deleteSelectedBlocks, moveBlocks } = useBlockManager({
     blocks, setBlocks
   });
 
@@ -77,12 +81,10 @@ export const NotionEditor: React.FC<NotionEditorProps> = ({
     undo, redo, handleCopy, handlePaste
   });
 
-  // Único handler de mouse — o resto é via listeners nativos no document
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
     const target = e.target as HTMLElement;
     if (target.closest('.notion-block-content') || target.closest('.drag-handle')) return;
     clearSelection();
-    e.preventDefault();
     setSlashMenu(prev => ({ ...prev, isOpen: false }));
     startSelection(e);
   }, [startSelection, clearSelection]);
@@ -91,7 +93,7 @@ export const NotionEditor: React.FC<NotionEditorProps> = ({
     e.stopPropagation();
     clearSelection();
     const lastBlock = blocks[blocks.length - 1];
-    if (lastBlock && lastBlock.type === 'text' && lastBlock.content === '') {
+    if (lastBlock && lastBlock.type === 'text' && isContentEmpty(lastBlock.content)) {
       focusBlock(lastBlock.id);
     } else {
       addBlock(lastBlock?.id);
@@ -103,20 +105,25 @@ export const NotionEditor: React.FC<NotionEditorProps> = ({
     if (didDragSelect()) return;
 
     const blocksOnPage = pageBlocks
-      .map(b => document.getElementById(`editable-${b.id}`))
+      .map(b => document.querySelector(`[data-block-id="${b.id}"]`) as HTMLElement | null)
       .filter(Boolean) as HTMLElement[];
     if (blocksOnPage.length === 0) return;
 
-    // Check if click is below the last block on this page
     const lastBlockEl = blocksOnPage[blocksOnPage.length - 1];
     const lastRect = lastBlockEl.getBoundingClientRect();
     if (e.clientY > lastRect.bottom) {
-      // Click is below all blocks — create or focus empty last block
-      const lastBlock = blocks[blocks.length - 1];
-      if (lastBlock && lastBlock.type === 'text' && lastBlock.content === '') {
-        focusBlock(lastBlock.id);
+      const lastPageBlock = pageBlocks[pageBlocks.length - 1];
+      const isLastPage = lastPageBlock.id === blocks[blocks.length - 1].id;
+
+      if (isLastPage) {
+        const lastBlock = blocks[blocks.length - 1];
+        if (lastBlock && lastBlock.type === 'text' && isContentEmpty(lastBlock.content)) {
+          focusBlock(lastBlock.id);
+        } else {
+          addBlock(lastBlock?.id);
+        }
       } else {
-        addBlock(lastBlock?.id);
+        focusBlock(lastPageBlock.id);
       }
       return;
     }
@@ -131,7 +138,7 @@ export const NotionEditor: React.FC<NotionEditorProps> = ({
       if (dist < minDst) { minDst = dist; closest = b; }
     }
 
-    closest.focus();
+    closest.focus({ preventScroll: true });
     const range = document.createRange();
     const sel = window.getSelection();
     if (sel) {
@@ -144,58 +151,82 @@ export const NotionEditor: React.FC<NotionEditorProps> = ({
 
   const handleSlashMenuSelect = useCallback((type: BlockData['type']) => {
     if (!slashMenu.blockId) return;
-    const currentBlock = blocks.find(b => b.id === slashMenu.blockId);
-    if (!currentBlock) return;
 
-    let cleanContent = currentBlock.content;
-    const selection = window.getSelection();
-    if (selection && selection.rangeCount > 0 && selection.focusNode) {
-      const blockEl = document.getElementById(`editable-${slashMenu.blockId}`);
-      if (blockEl && blockEl.contains(selection.focusNode)) {
-        const currentPos = selection.anchorOffset;
-        const textBefore = cleanContent.slice(0, currentPos);
-        const slashIndex = textBefore.lastIndexOf('/');
-        if (slashIndex !== -1) {
-          cleanContent = cleanContent.slice(0, slashIndex) + cleanContent.slice(currentPos);
-        }
+    const blockEl = document.getElementById(`editable-${slashMenu.blockId}`);
+    let cleanContent = '';
+
+    if (blockEl) {
+      const walker = document.createTreeWalker(blockEl, NodeFilter.SHOW_TEXT);
+      let lastSlashNode: Text | null = null;
+      let lastSlashIdx = -1;
+      while (walker.nextNode()) {
+        const node = walker.currentNode as Text;
+        const text = node.textContent || '';
+        const idx = text.lastIndexOf('/');
+        if (idx !== -1) { lastSlashNode = node; lastSlashIdx = idx; }
       }
-    }
-    if (cleanContent === currentBlock.content) {
-      if (cleanContent.trim().endsWith('/')) {
-        cleanContent = cleanContent.slice(0, cleanContent.lastIndexOf('/'));
+      if (lastSlashNode && lastSlashIdx !== -1) {
+        lastSlashNode.deleteData(lastSlashIdx, (lastSlashNode.textContent || '').length - lastSlashIdx);
       }
+      cleanContent = blockEl.innerHTML;
+      if (isContentEmpty(cleanContent)) cleanContent = '';
     }
 
-    if (type === 'table') {
-      const el = document.getElementById(`editable-${slashMenu.blockId}`);
-      if (el) el.innerText = '';
-      updateBlock(slashMenu.blockId, {
-        type,
-        content: '',
-        tableData: createDefaultTableData(),
-      });
+    if (type === 'divider') {
+      if (blockEl) blockEl.innerHTML = '';
+      const idx = blocks.findIndex(b => b.id === slashMenu.blockId);
+      const newTextBlock: BlockData = { id: generateId(), type: 'text', content: '' };
+      const newBlocks = blocks.map(b => b.id === slashMenu.blockId ? { ...b, type: 'divider' as const, content: '' } : b);
+      newBlocks.splice(idx + 1, 0, newTextBlock);
+      setBlocks(newBlocks);
       setSlashMenu(prev => ({ ...prev, isOpen: false }));
-      // Focus first cell after render
+      focusBlock(newTextBlock.id);
+    } else if (type === 'image') {
+      if (blockEl) blockEl.innerHTML = '';
+      const idx = blocks.findIndex(b => b.id === slashMenu.blockId);
+      const newTextBlock: BlockData = { id: generateId(), type: 'text', content: '' };
+      const newBlocks = blocks.map(b =>
+        b.id === slashMenu.blockId
+          ? { ...b, type: 'image' as const, content: '', imageData: { src: '', width: 50, alignment: 'center' as const } }
+          : b
+      );
+      newBlocks.splice(idx + 1, 0, newTextBlock);
+      setBlocks(newBlocks);
+      setSlashMenu(prev => ({ ...prev, isOpen: false }));
+    } else if (type === 'table') {
+      if (blockEl) blockEl.innerHTML = '';
+      updateBlock(slashMenu.blockId, { type, content: '', tableData: createDefaultTableData() });
+      setSlashMenu(prev => ({ ...prev, isOpen: false }));
       setTimeout(() => {
-        const firstCell = document.querySelector(
-          `[data-table-cell="${slashMenu.blockId}-0-0"]`
-        ) as HTMLElement;
-        firstCell?.focus();
+        const firstCell = document.querySelector(`[data-table-cell="${slashMenu.blockId}-0-0"]`) as HTMLElement;
+        firstCell?.focus({ preventScroll: true });
       }, 50);
     } else {
-      const el = document.getElementById(`editable-${slashMenu.blockId}`);
-      if (el) el.innerText = cleanContent;
+      if (blockEl) blockEl.innerHTML = cleanContent;
       updateBlock(slashMenu.blockId, { type, content: cleanContent });
       setSlashMenu(prev => ({ ...prev, isOpen: false }));
       focusBlock(slashMenu.blockId);
     }
-  }, [slashMenu.blockId, blocks, updateBlock]);
+  }, [slashMenu.blockId, blocks, updateBlock, setBlocks]);
 
-  const pages = getPaginatedBlocks(blocks, blockHeights, viewMode);
+  const pages = getPaginatedBlocks(blocks, blockHeights, viewMode, config.pageContentHeight);
+
+  // Pre-compute list numbers for all blocks to avoid passing the entire blocks array to Block
+  const listNumbers = useMemo(() => {
+    const map: Record<string, number> = {};
+    blocks.forEach((block, idx) => {
+      if (block.type === 'numbered_list') {
+        map[block.id] = getListNumber(block, blocks, idx);
+      }
+    });
+    return map;
+  }, [blocks]);
+
+  const lastBlockId = blocks[blocks.length - 1]?.id;
 
   return (
     <div
-      className={`min-h-screen text-gray-800 font-sans selection:bg-blue-200 ${
+      className={`min-h-screen text-gray-800 selection:bg-blue-200 ${
         selectionBox ? 'select-none' : ''
       } ${viewMode === 'paginated' ? 'bg-gray-100' : 'bg-white'}`}
       onMouseDown={handleMouseDown}
@@ -209,15 +240,18 @@ export const NotionEditor: React.FC<NotionEditorProps> = ({
         onRedo={redo}
         viewMode={viewMode}
         onToggleViewMode={() => setViewMode(prev => (prev === 'continuous' ? 'paginated' : 'continuous'))}
+        documentFont={documentFont}
+        onDocumentFontChange={setDocumentFont}
       />
 
       <div
         ref={containerRef}
         className={`mx-auto relative cursor-text transition-all duration-300 ${
           viewMode === 'paginated'
-            ? 'pt-8'
-            : 'max-w-3xl mt-12 px-12 pb-64 min-h-[80vh]'
+            ? 'pt-8 overflow-x-hidden'
+            : 'max-w-3xl mt-12 px-12 pb-64 min-h-[80vh] overflow-x-hidden'
         }`}
+        style={{ fontFamily: documentFont || undefined }}
         onDragOver={handleContainerDragOver}
         onDrop={handleDrop}
       >
@@ -226,7 +260,7 @@ export const NotionEditor: React.FC<NotionEditorProps> = ({
             key={pageIndex}
             className={
               viewMode === 'paginated'
-                ? 'min-h-[297mm] bg-white shadow-lg px-[20mm] py-[15mm] mb-8 mx-auto max-w-[210mm]'
+                ? 'min-h-[297mm] bg-white shadow-lg px-[20mm] py-[15mm] mb-8 mx-auto max-w-[210mm] overflow-x-hidden'
                 : ''
             }
             onClick={e => handlePageClick(e, pageBlocks)}
@@ -236,13 +270,16 @@ export const NotionEditor: React.FC<NotionEditorProps> = ({
                 key={block.id}
                 index={index}
                 block={block}
-                blocks={blocks}
-                globalIndex={blocks.findIndex(b => b.id === block.id)}
+                listNumber={listNumbers[block.id] || 1}
+                isLastBlock={block.id === lastBlockId}
                 isSelected={selectedIds.has(block.id)}
                 updateBlock={updateBlock}
                 addBlock={addBlock}
+                addBlockBefore={addBlockBefore}
+                addBlockWithContent={addBlockWithContent}
                 addListBlock={addListBlock}
                 removeBlock={removeBlock}
+                mergeWithPrevious={mergeWithPrevious}
                 setSlashMenu={setSlashMenu}
                 blockRef={el => (blockRefs.current[block.id] = el)}
                 onDragStart={handleDragStart}
@@ -269,6 +306,35 @@ export const NotionEditor: React.FC<NotionEditorProps> = ({
           onSelect={handleSlashMenuSelect}
         />
       )}
+
+      {!slashMenu.isOpen && <FloatingToolbar documentFont={documentFont} blocks={blocks} updateBlock={updateBlock} />}
     </div>
+  );
+};
+
+// Main export — sets up FontLoader + data source
+export const NotionEditor: React.FC<NotionEditorProps> = ({
+  initialBlocks = [DEFAULT_BLOCK],
+  onChange,
+  defaultViewMode = 'paginated',
+  title = 'MiniNotion',
+  dataSource: externalDataSource,
+  config = {},
+}) => {
+  const localDataSource = useLocalDataSource(initialBlocks, config.historyDebounceMs);
+  const dataSource = externalDataSource || localDataSource;
+
+  return (
+    <FontLoader fetchFonts={config.fetchFonts}>
+      <EditorProvider dataSource={dataSource}>
+        <NotionEditorInner
+          dataSource={dataSource}
+          onChange={onChange}
+          defaultViewMode={defaultViewMode}
+          title={title}
+          config={config}
+        />
+      </EditorProvider>
+    </FontLoader>
   );
 };

@@ -1,19 +1,26 @@
 'use client';
 
-import React, { useRef, useEffect, Dispatch, SetStateAction } from 'react';
+import React, { useRef, useEffect, useCallback, Dispatch, SetStateAction, memo } from 'react';
 import { GripVertical } from 'lucide-react';
 import { BlockData, BlockType, SlashMenuState, DropTarget } from '../types';
-import { isListType, getBulletChar, getListNumber } from '../utils';
+import { isListType, getBulletChar, isContentEmpty } from '../utils';
 import { TableBlock } from './TableBlock';
+import { ImageBlock } from './ImageBlock';
+import { useBlockKeyboard, findEditable, focusEditable } from '../hooks/useBlockKeyboard';
 
 interface BlockProps {
   block: BlockData;
   index: number;
   isSelected: boolean;
+  listNumber: number;
+  isLastBlock: boolean;
   updateBlock: (id: string, updates: Partial<BlockData>) => void;
   addBlock: (afterId: string) => void;
+  addBlockBefore: (beforeId: string) => void;
+  addBlockWithContent: (afterId: string, content: string) => void;
   addListBlock: (afterId: string, type: BlockType, indent: number) => void;
   removeBlock: (id: string) => void;
+  mergeWithPrevious: (id: string) => void;
   setSlashMenu: Dispatch<SetStateAction<SlashMenuState>>;
   blockRef: (el: HTMLDivElement | null) => void;
   onDragStart: (e: React.DragEvent, id: string) => void;
@@ -22,36 +29,53 @@ interface BlockProps {
   dropTarget: DropTarget | null;
   onHeightChange: (id: string, height: number) => void;
   onClearSelection: () => void;
-  blocks: BlockData[];
-  globalIndex: number;
 }
 
 const BLOCK_STYLES: Record<string, string> = {
-  h1: 'text-4xl font-bold my-0 p-0 text-gray-900 leading-none',
-  h2: 'text-2xl font-semibold my-0 p-0 text-gray-800 leading-none',
-  text: 'text-base my-1 text-gray-700 leading-relaxed',
-  bullet_list: 'text-base my-0 text-gray-700 leading-relaxed',
-  numbered_list: 'text-base my-0 text-gray-700 leading-relaxed',
+  h1: 'font-bold my-0 p-0 text-gray-900',
+  h2: 'font-semibold my-0 p-0 text-gray-800',
+  h3: 'font-semibold my-0 p-0 text-gray-800',
+  text: 'my-0 text-gray-700',
+  bullet_list: 'my-0 text-gray-700',
+  numbered_list: 'my-0 text-gray-700',
+  divider: '',
   table: '',
+  image: '',
 };
 
-// Handle wrapper height matches each block's first line height for vertical centering
+const BLOCK_INLINE_STYLES: Record<string, React.CSSProperties> = {
+  h1: { fontSize: '1.875em', lineHeight: 1.3 },
+  h2: { fontSize: '1.5em', lineHeight: 1.3 },
+  h3: { fontSize: '1.25em', lineHeight: 1.3 },
+  text: { fontSize: '16px', lineHeight: 1.5 },
+  bullet_list: { fontSize: '16px', lineHeight: 1.5 },
+  numbered_list: { fontSize: '16px', lineHeight: 1.5 },
+};
+
 const HANDLE_LINE: Record<string, string> = {
-  h1: 'h-9',             // 36px = text-4xl with leading-none
-  h2: 'h-6',             // 24px = text-2xl with leading-none
-  text: 'h-[26px] mt-1', // 26px = text-base * leading-relaxed, mt-1 matches text's my-1
-  bullet_list: 'h-[26px]',
-  numbered_list: 'h-[26px]',
+  h1: 'h-[39px]',
+  h2: 'h-[31px]',
+  h3: 'h-[26px]',
+  text: 'h-[24px]',
+  bullet_list: 'h-[24px]',
+  numbered_list: 'h-[24px]',
+  divider: 'h-4',
   table: 'h-6',
+  image: 'h-6',
 };
 
-export const Block: React.FC<BlockProps> = ({
+const BlockInner: React.FC<BlockProps> = ({
   block,
   isSelected,
+  listNumber,
+  isLastBlock,
   updateBlock,
   addBlock,
+  addBlockBefore,
+  addBlockWithContent,
   addListBlock,
   removeBlock,
+  mergeWithPrevious,
   setSlashMenu,
   blockRef,
   onDragStart,
@@ -60,10 +84,10 @@ export const Block: React.FC<BlockProps> = ({
   dropTarget,
   onHeightChange,
   onClearSelection,
-  blocks,
-  globalIndex
 }) => {
   const internalRef = useRef<HTMLDivElement>(null);
+  // Track whether the user is actively editing this block's contentEditable
+  const isLocalEditRef = useRef(false);
 
   useEffect(() => {
     if (internalRef.current) {
@@ -79,12 +103,27 @@ export const Block: React.FC<BlockProps> = ({
     }
   }, [block.id, onHeightChange, blockRef]);
 
+  // Sync is-empty class with content
   useEffect(() => {
-    if (block.type === 'table') return;
+    if (block.type === 'table' || block.type === 'divider' || block.type === 'image') return;
     const el = document.getElementById(`editable-${block.id}`);
-    if (el && el.innerText !== block.content) {
+    if (el) {
+      el.classList.toggle('is-empty', isContentEmpty(block.content));
+    }
+  }, [block.content, block.id, block.type]);
+
+  // Sync innerHTML from external changes only (undo/redo, paste, collaborative edits)
+  // Skip when user is actively typing in this block (isLocalEditRef)
+  useEffect(() => {
+    if (block.type === 'table' || block.type === 'divider' || block.type === 'image') return;
+    if (isLocalEditRef.current) {
+      isLocalEditRef.current = false;
+      return;
+    }
+    const el = document.getElementById(`editable-${block.id}`);
+    if (el && el.innerHTML !== block.content) {
       const isFocused = document.activeElement === el;
-      el.innerText = block.content;
+      el.innerHTML = block.content;
       if (isFocused && block.content) {
         const range = document.createRange();
         const sel = window.getSelection();
@@ -96,79 +135,20 @@ export const Block: React.FC<BlockProps> = ({
     }
   }, [block.content, block.id, block.type]);
 
+  const handleKeyDown = useBlockKeyboard({
+    block, isLastBlock, updateBlock, addBlock, addBlockBefore,
+    addBlockWithContent, addListBlock, removeBlock, mergeWithPrevious, setSlashMenu,
+  });
+
+  const handleInput = useCallback((e: React.FormEvent<HTMLDivElement>) => {
+    const el = e.currentTarget;
+    isLocalEditRef.current = true;
+    el.classList.toggle('is-empty', isContentEmpty(el.innerHTML));
+    updateBlock(block.id, { content: el.innerHTML });
+  }, [block.id, updateBlock]);
+
   const isList = isListType(block.type);
   const indent = block.indent ?? 0;
-
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    // Tab indent/dedent for lists
-    if (e.key === 'Tab' && isList) {
-      e.preventDefault();
-      if (e.shiftKey) {
-        if (indent > 0) updateBlock(block.id, { indent: indent - 1 });
-      } else {
-        if (indent < 3) updateBlock(block.id, { indent: indent + 1 });
-      }
-      return;
-    }
-
-    if (e.key === '/') {
-      setTimeout(() => {
-        const selection = window.getSelection();
-        if (selection && selection.rangeCount > 0) {
-          const rect = selection.getRangeAt(0).getBoundingClientRect();
-          setSlashMenu({
-            isOpen: true,
-            x: rect.left,
-            y: rect.bottom + 10,
-            blockId: block.id
-          });
-        }
-      }, 0);
-    }
-
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      if (isList) {
-        if (block.content.trim() === '') {
-          // Empty list item → convert to text
-          updateBlock(block.id, { type: 'text', indent: undefined });
-        } else {
-          addListBlock(block.id, block.type, indent);
-        }
-      } else {
-        addBlock(block.id);
-      }
-    }
-
-    if (e.key === 'Backspace' && (!block.content || block.content.trim() === '')) {
-      e.preventDefault();
-      if (isList) {
-        updateBlock(block.id, { type: 'text', indent: undefined });
-      } else {
-        removeBlock(block.id);
-      }
-    }
-
-    if (e.key === 'ArrowUp') {
-      const currentEl = document.getElementById(`editable-${block.id}`);
-      const blockContainer = currentEl?.closest('.group');
-      const prev = blockContainer?.previousSibling as HTMLElement;
-      if (prev) {
-        const editable = prev.querySelector('[contenteditable]') as HTMLElement;
-        if (editable) editable.focus();
-      }
-    }
-
-    if (e.key === 'ArrowDown') {
-      const currentEl = document.getElementById(`editable-${block.id}`);
-      const blockContainer = currentEl?.closest('.group');
-      const next = blockContainer?.nextSibling as HTMLElement;
-      if (next) {
-        const editable = next.querySelector('[contenteditable]') as HTMLElement;
-        if (editable) editable.focus();
-      }
-    }
-  };
 
   const renderListMarker = () => {
     if (!isList) return null;
@@ -183,24 +163,28 @@ export const Block: React.FC<BlockProps> = ({
         </span>
       );
     }
-    // numbered_list
-    const num = getListNumber(block, blocks, globalIndex);
     return (
       <span
         className="select-none text-gray-400 shrink-0 inline-flex items-center justify-end pr-1"
         style={{ minWidth: 24 + paddingLeft, paddingLeft }}
       >
-        {num}.
+        {listNumber}.
       </span>
     );
   };
 
   const isTable = block.type === 'table';
+  const isDivider = block.type === 'divider';
+  const isImage = block.type === 'image';
+
+  const contentStyle = BLOCK_INLINE_STYLES[block.type];
+  const alignStyle = block.align ? { ...contentStyle, textAlign: block.align as React.CSSProperties['textAlign'] } : contentStyle;
 
   return (
     <div
       ref={internalRef}
-      className="group relative flex items-start -ml-12 pr-2 py-0.5 my-0.5"
+      data-block-id={block.id}
+      className="group relative flex items-start -ml-12 pr-2 py-px my-px"
       onDragOver={e => onDragOver(e, block.id)}
       onDrop={e => { e.stopPropagation(); onDrop(e); }}
     >
@@ -228,19 +212,45 @@ export const Block: React.FC<BlockProps> = ({
       <div className={`flex-1 min-w-0 notion-block-content py-0.5 px-1 rounded-sm transition-colors ${
         isSelected ? 'bg-blue-100' : 'hover:bg-gray-50'
       }`}>
-        {isTable ? (
-          <TableBlock block={block} updateBlock={updateBlock} />
+        {isDivider ? (
+          <div className="py-2">
+            <hr className="border-t border-gray-300" />
+          </div>
+        ) : isImage ? (
+          <ImageBlock
+            block={block}
+            updateBlock={updateBlock}
+            removeBlock={removeBlock}
+          />
+        ) : isTable ? (
+          <TableBlock
+            block={block}
+            updateBlock={updateBlock}
+            onNavigateOut={(direction) => {
+              const container = internalRef.current;
+              if (!container) return;
+              if (direction === 'down') {
+                const target = findEditable(container.nextElementSibling as HTMLElement, 'next');
+                if (target) focusEditable(target, false);
+                else if (isLastBlock) addBlock(block.id);
+              } else {
+                const target = findEditable(container.previousElementSibling as HTMLElement, 'prev');
+                if (target) focusEditable(target, true);
+              }
+            }}
+          />
         ) : (
-          <div className={`flex items-start ${isList ? '' : ''}`}>
+          <div className="flex items-start">
             {renderListMarker()}
             <div
               id={`editable-${block.id}`}
               contentEditable
               suppressContentEditableWarning
-              className={`outline-none empty:before:text-gray-300 cursor-text flex-1 min-w-0 ${BLOCK_STYLES[block.type]} focus:empty:before:content-[attr(data-placeholder)]`}
+              className={`outline-none cursor-text flex-1 min-w-0 editable-block ${BLOCK_STYLES[block.type]}`}
+              style={alignStyle}
               data-placeholder={isList ? 'Lista...' : "Digite '/' para comandos..."}
               onKeyDown={handleKeyDown}
-              onInput={e => updateBlock(block.id, { content: e.currentTarget.innerText })}
+              onInput={handleInput}
               onFocus={onClearSelection}
             />
           </div>
@@ -249,3 +259,15 @@ export const Block: React.FC<BlockProps> = ({
     </div>
   );
 };
+
+// Memoize Block — only re-render when its own data changes
+export const Block = memo(BlockInner, (prev, next) => {
+  return (
+    prev.block === next.block &&
+    prev.isSelected === next.isSelected &&
+    prev.listNumber === next.listNumber &&
+    prev.isLastBlock === next.isLastBlock &&
+    prev.dropTarget?.id === next.dropTarget?.id &&
+    prev.dropTarget?.position === next.dropTarget?.position
+  );
+});

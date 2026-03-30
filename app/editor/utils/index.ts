@@ -1,7 +1,10 @@
 import { BlockData, BlockType, TableData } from '../types';
 
-// Gera ID único
-export const generateId = () => Math.random().toString(36).substr(2, 9);
+// Gera ID único (crypto.randomUUID é mais seguro contra colisões em cenários multiplayer)
+export const generateId = (): string =>
+  typeof crypto !== 'undefined' && crypto.randomUUID
+    ? crypto.randomUUID()
+    : Math.random().toString(36).substr(2, 9);
 
 // Bloco inicial padrão
 export const createEmptyBlock = (): BlockData => ({
@@ -43,7 +46,7 @@ export const createDefaultTableData = (): TableData => ({
     Array.from({ length: 3 }, () => ({ content: '' }))
   ),
   columnWidths: [33.33, 33.33, 33.34],
-  hasHeaderRow: true,
+  hasHeaderRow: false,
 });
 
 // Constantes de paginação (A4 em pixels ~96dpi: 794x1123, com margens de 20mm = ~75px cada lado)
@@ -53,8 +56,10 @@ export const PAGE_CONTENT_HEIGHT = 950; // Altura útil da página
 export const getPaginatedBlocks = (
   blocks: BlockData[],
   blockHeights: Record<string, number>,
-  viewMode: 'continuous' | 'paginated'
+  viewMode: 'continuous' | 'paginated',
+  pageContentHeight?: number
 ): BlockData[][] => {
+  const PAGE_H = pageContentHeight || PAGE_CONTENT_HEIGHT;
   if (viewMode === 'continuous') return [blocks];
 
   const pages: BlockData[][] = [];
@@ -65,7 +70,7 @@ export const getPaginatedBlocks = (
     const h = blockHeights[block.id] || 24;
 
     // Se o bloco sozinho é maior que a página, coloca numa página própria
-    if (h >= PAGE_CONTENT_HEIGHT) {
+    if (h >= PAGE_H) {
       if (currentPage.length > 0) {
         pages.push(currentPage);
         currentPage = [];
@@ -77,7 +82,7 @@ export const getPaginatedBlocks = (
     }
 
     // Se adicionar esse bloco estoura a página, começa nova página
-    if (currentH + h > PAGE_CONTENT_HEIGHT && currentPage.length > 0) {
+    if (currentH + h > PAGE_H && currentPage.length > 0) {
       pages.push(currentPage);
       currentPage = [];
       currentH = 0;
@@ -92,17 +97,17 @@ export const getPaginatedBlocks = (
 };
 
 // Foca no elemento editável de um bloco
-export const focusBlock = (blockId: string, collapseToEnd = true) => {
+export const focusBlock = (blockId: string, position: 'end' | 'start' | false = 'end') => {
   setTimeout(() => {
     const el = document.getElementById(`editable-${blockId}`);
     if (el) {
-      el.focus();
-      if (collapseToEnd) {
+      el.focus({ preventScroll: true });
+      if (position) {
         const range = document.createRange();
         const sel = window.getSelection();
         if (sel) {
           range.selectNodeContents(el);
-          range.collapse(false);
+          range.collapse(position === 'start');
           sel.removeAllRanges();
           sel.addRange(range);
         }
@@ -111,22 +116,18 @@ export const focusBlock = (blockId: string, collapseToEnd = true) => {
   }, 0);
 };
 
-// Copia texto para clipboard (compatível com iframes)
-export const copyToClipboard = (text: string) => {
-  const textArea = document.createElement('textarea');
-  textArea.value = text;
-  textArea.style.position = 'fixed';
-  textArea.style.left = '-9999px';
-  textArea.style.top = '0';
-  document.body.appendChild(textArea);
-  textArea.focus();
-  textArea.select();
-
-  try {
-    document.execCommand('copy');
-  } catch (err) {
-    console.error('Falha ao copiar', err);
-  }
-
-  document.body.removeChild(textArea);
+// Check if HTML content is effectively empty (no visible text)
+export const isContentEmpty = (content: string): boolean => {
+  if (!content) return true;
+  const text = content.replace(/<[^>]*>/g, '').trim();
+  return text === '';
 };
+
+// Extract plain text from HTML content
+export const htmlToPlainText = (html: string): string => {
+  if (!html) return '';
+  const div = document.createElement('div');
+  div.innerHTML = html;
+  return div.textContent || '';
+};
+
